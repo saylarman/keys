@@ -4,6 +4,7 @@
 import os
 import re
 import io
+import zipfile
 import json
 import base64
 import hashlib
@@ -194,7 +195,7 @@ def jwk_to_public_key_obj(jwk_dict: Dict[str, Any]):
 # Analyze & Convert
 # =========================
 
-def analyze_bytes(raw: bytes, filename: str = "input") -> Dict[str, Any]:
+def analyze_bytes(raw: bytes, filename: str = "input", password: Optional[str] = None) -> Dict[str, Any]:
     text = None
     try:
         text = raw.decode("utf-8")
@@ -211,6 +212,67 @@ def analyze_bytes(raw: bytes, filename: str = "input") -> Dict[str, Any]:
         "revocation": None,
         "guidance": {},
     }
+
+    # 0) Try PKCS#12
+    if password is not None: # Try even with empty password
+        try:
+            pass_bytes = password.encode()
+            p12 = serialization.load_pkcs12(raw, pass_bytes)
+            priv, cert, chain = p12.key, p12.cert, p12.ca_certs
+
+            if priv:
+                out["type"] = "PKCS#12 Archive"
+
+                # Analyze the private key
+                priv_details = {}
+                if isinstance(priv, rsa.RSAPrivateKey):
+                    priv_details = {"algorithm": "RSA", "key_size": priv.key_size, "security": estimate_security(priv.key_size, "RSA")}
+                elif isinstance(priv, ec.EllipticCurvePrivateKey):
+                    priv_details = {"algorithm": "EC", "curve": priv.curve.name, "key_size": priv.key_size, "security": estimate_security(priv.key_size, "EC")}
+
+                # Analyze the main certificate
+                cert_details = {}
+                if cert:
+                    cert_details = {
+                        "subject": cert.certificate.subject.rfc4514_string(),
+                        "issuer": cert.certificate.issuer.rfc4514_string(),
+                        "serial_number": hex(cert.certificate.serial_number),
+                        "not_before": str(cert.certificate.not_valid_before),
+                        "not_after": str(cert.certificate.not_valid_after),
+                    }
+
+                # Combine details
+                out["details"] = {
+                    "archive_contents": {
+                        "private_key": priv_details,
+                        "certificate": cert_details if cert else "Not present",
+                        "additional_certs_count": len(chain)
+                    }
+                }
+
+                # Get JWK from private key
+                out["jwk"] = private_key_to_jwk_obj(priv)
+
+                # Build cert chain display from friendly names
+                full_chain_names = []
+                if cert: full_chain_names.append(cert.friendly_name.decode() if cert.friendly_name else 'Unnamed Certificate')
+                for c in chain: full_chain_names.append(c.friendly_name.decode() if c.friendly_name else 'Unnamed CA Certificate')
+                out["cert_chain"] = full_chain_names
+
+                # Add guidance
+                out["guidance"] = {
+                    "note": "محتویات فایل PKCS#12 با موفقیت استخراج شد.",
+                    "openssl_export_key": f"openssl pkcs12 -in {filename} -nocerts -out private_key.pem -nodes -password pass:{password}",
+                    "openssl_export_cert": f"openssl pkcs12 -in {filename} -nokeys -clcerts -out certificate.pem -password pass:{password}",
+                    "openssl_export_chain": f"openssl pkcs12 -in {filename} -nokeys -cacerts -out chain.pem -password pass:{password}"
+                }
+
+                return out
+        except Exception:
+            # Could be wrong password or not a p12 file. Silently fail and try other formats.
+            # We might want to add a message if a password was provided but failed.
+            out["guidance"] = {"note": "رمز عبور برای فایل PKCS#12 اشتباه است یا فایل فرمت دیگری دارد."}
+
 
     # 1) Try Private Key (PEM)
     if text and "BEGIN" in text and "PRIVATE KEY" in text:
@@ -407,6 +469,27 @@ def generate_selfsigned_from_priv(priv_pem: bytes, subject_cn: str = "example.co
     return cert.public_bytes(Encoding.PEM)
 
 
+def generate_private_key(key_type: str, rsa_key_size: int = 2048, ec_curve: str = "SECP384R1") -> bytes:
+    """Generates an RSA or EC private key and returns it as PEM bytes."""
+    if key_type == "rsa":
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=rsa_key_size,
+        )
+    elif key_type == "ec":
+        # Note: The curve name from the form needs to match an object in `cryptography.hazmat.primitives.asymmetric.ec`
+        curve_obj = getattr(ec, ec_curve.upper())()
+        private_key = ec.generate_private_key(curve_obj)
+    else:
+        raise ValueError("Unsupported key type")
+
+    return private_key.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=NoEncryption(),
+    )
+
+
 # =========================
 # Flask Web App
 # =========================
@@ -414,6 +497,10 @@ def generate_selfsigned_from_priv(priv_pem: bytes, subject_cn: str = "example.co
 DOWNLOAD_DIR = "/tmp"
 app = Flask(__name__)
 app.config["DOWNLOAD_DIR"] = DOWNLOAD_DIR
+
+@app.template_filter('fromjson')
+def from_json_filter(value):
+    return json.loads(value)
 
 INDEX_HTML = '''
 <!doctype html>
@@ -436,6 +523,15 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
 .badge.green{background:#e7f8ed;color:#0b7a35}
 .badge.orange{background:#fff5e6;color:#975a00}
 .badge.red{background:#fdecea;color:#a30000}
+.styled-table{border-collapse:collapse;margin:25px 0;font-size:.9em;width:100%;box-shadow:0 0 20px rgba(0,0,0,.15)}
+.styled-table thead tr{background-color:#2c7be5;color:#fff;text-align:left}
+.styled-table th,.styled-table td{padding:12px 15px}
+.styled-table tbody tr{border-bottom:1px solid #ddd}
+.styled-table tbody tr:nth-of-type(even){background-color:#f3f3f3}
+.styled-table tbody tr:last-of-type{border-bottom:2px solid #2c7be5}
+.accordion-header{background-color:#f1f1f1;cursor:pointer;padding:12px;border:1px solid #ddd;margin-top:5px;border-radius:8px}
+.accordion-header:hover{background-color:#e8e8e8}
+.accordion-content{padding:10px 18px;display:none;overflow:hidden;background-color:#fafafa;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px}
 </style>
 </head>
 <body>
@@ -444,14 +540,50 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
 <div class="card">
   <h2>۱) تحلیل کلید/سرتیفیکیت</h2>
   <form method="post" action="/analyze" enctype="multipart/form-data">
-    <label>فایل PEM/Cert/SSH:</label>
+    <label>فایل کلید/سرتیفیکیت (PEM, P12, ...):</label>
     <input type="file" name="file" required>
+    <label>Password (برای فایل P12/PFX، اختیاری):</label>
+    <input type="password" name="password">
     <button class="btn" type="submit">تحلیل</button>
   </form>
 </div>
 
 <div class="card">
-  <h2>۲) ایجاد CSR / Self-Signed</h2>
+  <h2>۲) ساخت کلید خصوصی جدید</h2>
+  <form method="post" action="/generate">
+    <div class="row" onchange="toggleKeyParams()">
+      <div>
+        <label>نوع کلید:</label>
+        <select name="key_type" id="key_type">
+          <option value="rsa" selected>RSA</option>
+          <option value="ec">Elliptic Curve (EC)</option>
+        </select>
+      </div>
+      <div>
+        <div id="rsa_params">
+          <label>اندازه کلید (بیت):</label>
+          <select name="rsa_key_size">
+            <option value="2048">2048</option>
+            <option value="3072" selected>3072</option>
+            <option value="4096">4096</option>
+          </select>
+        </div>
+        <div id="ec_params" style="display:none;">
+          <label>نام منحنی:</label>
+          <select name="ec_curve">
+            <option value="SECP256R1">SECP256R1 (P-256)</option>
+            <option value="SECP384R1">SECP384R1 (P-384)</option>
+            <option value="SECP521R1">SECP521R1 (P-521)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <button class="btn" type="submit">ساخت کلید</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>۳) ایجاد CSR / Self-Signed</h2>
   <form method="post" action="/create_from_priv" enctype="multipart/form-data">
     <label>Private Key (PEM):</label>
     <input type="file" name="priv" required>
@@ -467,7 +599,7 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
 </div>
 
 <div class="card">
-  <h2>۳) تبدیل فرمت‌ها</h2>
+  <h2>۴) تبدیل فرمت‌ها</h2>
   <form method="post" action="/convert" enctype="multipart/form-data">
     <label>Private Key (PEM):</label>
     <input type="file" name="priv" required>
@@ -478,7 +610,7 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
 </div>
 
 <div class="card">
-  <h2>۴) تطبیق Private Key و Certificate</h2>
+  <h2>۵) تطبیق Private Key و Certificate</h2>
   <form method="post" action="/match" enctype="multipart/form-data">
     <label>Private Key (PEM):</label>
     <input type="file" name="priv" required>
@@ -504,7 +636,82 @@ Self-Signed:  openssl req -x509 -new -key private.pem -days 365 -sha256 -out cer
   {% if result.badge %}
      <span class="badge {{result.badge.color}}">{{result.badge.text}}</span>
   {% endif %}
-  <pre>{{ result.json }}</pre>
+
+{% macro render_analysis(res) %}
+  <table class="styled-table">
+    <tbody>
+      <tr><td>Type</td><td>{{ res.type }}</td></tr>
+      {% if res.details.algorithm %}<tr><td>Algorithm</td><td>{{ res.details.algorithm }}</td></tr>{% endif %}
+      {% if res.details.key_size %}<tr><td>Key Size</td><td>{{ res.details.key_size }} bits</td></tr>{% endif %}
+      {% if res.details.curve %}<tr><td>Curve</td><td>{{ res.details.curve }}</td></tr>{% endif %}
+      {% if res.details.security %}<tr><td>Security</td><td><span class="badge {{'green' if res.details.security == 'Strong' else ('orange' if res.details.security == 'Medium' else 'red')}}">{{ res.details.security }}</span></td></tr>{% endif %}
+
+      {# Certificate Specific Fields #}
+      {% if res.type == "X.509 Certificate" %}
+        <tr><td>Subject</td><td><code>{{ res.details.subject }}</code></td></tr>
+        <tr><td>Issuer</td><td><code>{{ res.details.issuer }}</code></td></tr>
+        <tr><td>Serial Number</td><td><code>{{ res.details.serial_number }}</code></td></tr>
+        <tr><td>Valid From</td><td>{{ res.details.not_before }}</td></tr>
+        <tr><td>Valid Until</td><td>{{ res.details.not_after }}</td></tr>
+      {% endif %}
+
+      {# PKCS#12 Specific Fields #}
+      {% if res.type == "PKCS#12 Archive" %}
+        <tr><td colspan="2" style="background:#e8f0fe;"><strong>Private Key Details</strong></td></tr>
+        <tr><td>Algorithm</td><td>{{ res.details.archive_contents.private_key.algorithm }}</td></tr>
+        <tr><td>Key Size/Curve</td><td>{{ res.details.archive_contents.private_key.key_size or res.details.archive_contents.private_key.curve }}</td></tr>
+        <tr><td colspan="2" style="background:#e8f0fe;"><strong>Certificate Details</strong></td></tr>
+        {% if res.details.archive_contents.certificate != "Not present" %}
+          <tr><td>Subject</td><td><code>{{ res.details.archive_contents.certificate.subject }}</code></td></tr>
+          <tr><td>Issuer</td><td><code>{{ res.details.archive_contents.certificate.issuer }}</code></td></tr>
+        {% else %}
+          <tr><td>Certificate</td><td>Not present in archive</td></tr>
+        {% endif %}
+      {% endif %}
+    </tbody>
+  </table>
+
+  {% if res.fingerprints %}
+    <h4>Fingerprints</h4>
+    <pre style="font-size: 1.1em;">MD5:   {{ res.fingerprints.MD5.split(': ')[1] }}
+SHA1:  {{ res.fingerprints.SHA1.split(': ')[1] }}
+SHA256:{{ res.fingerprints.SHA256.split(': ')[1] }}{% if res.fingerprints.OpenSSH_SHA256 %}\nOpenSSH (SHA256): {{ res.fingerprints.OpenSSH_SHA256 }}{% endif %}</pre>
+  {% endif %}
+
+  {% if res.cert_chain %}
+    <h4>Certificate Chain ({{ res.cert_chain|length }} certs)</h4>
+    <ol style="font-size:0.9em; max-height:150px; overflow:auto; border:1px solid #ddd; padding:10px 10px 10px 30px; border-radius:8px;">
+    {% for item in res.cert_chain %}
+      <li><code>{{ item }}</code></li>
+    {% endfor %}
+    </ol>
+  {% endif %}
+
+  {% if res.guidance %}
+    <h4>Guidance & Raw Data</h4>
+    <details>
+        <summary>Click to view guidance and raw JSON data</summary>
+        <pre>{{ res | tojson(indent=2) }}</pre>
+    </details>
+  {% endif %}
+{% endmacro %}
+
+{# Main result rendering logic #}
+{% set data = result.json | fromjson %}
+{% if data.type == "Batch Analysis (Zip)" %}
+  <h4>Batch Analysis for: <code>{{ data.file }}</code></h4>
+  {% for item in data.batch_results %}
+    <div class="accordion-item">
+      <h4 class="accordion-header">{{ item.file }} ({{ item.type }})</h4>
+      <div class="accordion-content">
+        {{ render_analysis(item) }}
+      </div>
+    </div>
+  {% endfor %}
+{% else %}
+  <h4>Analysis for: <code>{{ data.file }}</code></h4>
+  {{ render_analysis(data) }}
+{% endif %}
   {% if result.download_name %}
     <p><a class="btn" href="/download?filename={{ result.download_path }}&name={{ result.download_name }}">دانلود خروجی</a></p>
   {% endif %}
@@ -514,6 +721,40 @@ Self-Signed:  openssl req -x509 -new -key private.pem -days 365 -sha256 -out cer
   {% endif %}
 </div>
 {% endif %}
+
+<script>
+function toggleKeyParams() {
+  var key_type = document.getElementById('key_type').value;
+  var rsa_params = document.getElementById('rsa_params');
+  var ec_params = document.getElementById('ec_params');
+  if (key_type === 'rsa') {
+    rsa_params.style.display = 'block';
+    ec_params.style.display = 'none';
+  } else {
+    rsa_params.style.display = 'none';
+    ec_params.style.display = 'block';
+  }
+}
+document.addEventListener('DOMContentLoaded', function() {
+    toggleKeyParams();
+    setupAccordion();
+});
+
+function setupAccordion() {
+    var acc = document.getElementsByClassName("accordion-header");
+    for (var i = 0; i < acc.length; i++) {
+        acc[i].addEventListener("click", function() {
+            this.classList.toggle("active");
+            var content = this.nextElementSibling;
+            if (content.style.display === "block") {
+                content.style.display = "none";
+            } else {
+                content.style.display = "block";
+            }
+        });
+    }
+}
+</script>
 
 </body>
 </html>
@@ -563,16 +804,21 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/analyze", methods=["POST"])
-def route_analyze():
-    file = request.files.get("file")
-    raw = file.read()
-    data = analyze_bytes(raw, filename=file.filename)
-    pie_div = _pie_div(data["details"].get("security"))
+def _render_analysis_result(data: Dict[str, Any]) -> str:
+    """Renders the analysis result to the main template."""
+    pie_div = ""
+    # Pie charts don't make sense for batch results, only for single-file security estimates.
+    if data.get("type") != "Batch Analysis (Zip)":
+        pie_div = _pie_div(data.get("details", {}).get("security"))
+
     html_report, md_report = _make_report_files(data)
     badge = None
-    sec = data["details"].get("security")
-    if sec == "Strong":
+    sec = data.get("details", {}).get("security")
+
+    # Special badge for batch results
+    if data.get("type") == "Batch Analysis (Zip)":
+        badge = {"text": f"{data['details']['file_count']} فایل تحلیل شد", "color": "green"}
+    elif sec == "Strong":
         badge = {"text": "امنیت قوی", "color": "green"}
     elif sec == "Medium":
         badge = {"text": "امنیت متوسط", "color": "orange"}
@@ -587,6 +833,93 @@ def route_analyze():
         "report_md": os.path.basename(md_report) if md_report else None,
         "download_name": None,
         "download_path": None,
+    }
+    return render_template_string(INDEX_HTML, result=result)
+
+
+@app.route("/analyze", methods=["POST"])
+def route_analyze():
+    file = request.files.get("file")
+    password = request.form.get("password") or None
+    raw = file.read()
+    filename = file.filename
+
+    # Check for zip file
+    if filename.lower().endswith(".zip"):
+        results = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for info in zf.infolist():
+                    if info.is_dir() or info.filename.startswith('__MACOSX'):
+                        continue # Skip directories and macosx metadata
+
+                    file_content = zf.read(info.filename)
+                    analysis = analyze_bytes(file_content, filename=info.filename, password=password)
+                    results.append(analysis)
+
+            # Format a batch result
+            data = {
+                "file": filename,
+                "type": "Batch Analysis (Zip)",
+                "details": {
+                    "file_count": len(results),
+                    "files_analyzed": [res["file"] for res in results]
+                },
+                "batch_results": results
+            }
+            return _render_analysis_result(data)
+
+        except zipfile.BadZipFile:
+            return "فایل Zip آپلود شده معتبر نیست.", 400
+        except Exception as e:
+            return f"خطا در پردازش فایل Zip: {e}", 500
+
+    # If not a zip file, proceed with single file analysis
+    data = analyze_bytes(raw, filename=filename, password=password)
+    return _render_analysis_result(data)
+
+
+@app.route("/generate", methods=["POST"])
+def route_generate():
+    key_type = request.form.get("key_type")
+
+    try:
+        if key_type == "rsa":
+            rsa_key_size = int(request.form.get("rsa_key_size", 2048))
+            key_pem = generate_private_key(key_type="rsa", rsa_key_size=rsa_key_size)
+            out_name = f"rsa_{rsa_key_size}_private_key.pem"
+        elif key_type == "ec":
+            ec_curve = request.form.get("ec_curve", "SECP384R1")
+            key_pem = generate_private_key(key_type="ec", ec_curve=ec_curve)
+            out_name = f"ec_{ec_curve}_private_key.pem"
+        else:
+            return "Invalid key type", 400
+    except Exception as e:
+        # Handle potential errors during key generation, e.g., invalid curve name
+        return f"Error generating key: {e}", 500
+
+
+    # Save the key for download
+    path = os.path.join(app.config["DOWNLOAD_DIR"], out_name)
+    with open(path, "wb") as f:
+        f.write(key_pem)
+
+    res = {
+        "status": "ok",
+        "action": "generate",
+        "key_type": key_type,
+        "note": f"کلید خصوصی جدید در فایل {out_name} ایجاد شد و آماده دانلود است.",
+    }
+    html_report, md_report = _make_report_files(res)
+
+    result = {
+        "plot_div": "",
+        "json": json.dumps(res, indent=2, ensure_ascii=False),
+        "badge": {"text": "کلید ایجاد شد", "color": "green"},
+        "report_html": os.path.basename(html_report) if html_report else None,
+        "report_md": os.path.basename(md_report) if md_report else None,
+        "download_name": out_name,
+        "download_path": out_name, # This is the filename for the template
     }
     return render_template_string(INDEX_HTML, result=result)
 
