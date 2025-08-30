@@ -789,19 +789,9 @@ def _make_report_files(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     return html_path, md_path
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
-    if request.method == "POST":
-        domain = request.form.get("domain")  # ورودی از فرم
-        if not domain:
-            return "لطفاً دامنه وارد کنید!", 400
-
-        # اجرای عملیات اصلی (مثلاً اسکن یا تولید گزارش)
-        result = {"domain": domain, "status": "done"}
-
-        return jsonify(result)  # برگردوندن خروجی به صورت JSON
-
-    return render_template("index.html")
+    return render_template_string(INDEX_HTML)
 
 
 def _render_analysis_result(data: Dict[str, Any]) -> str:
