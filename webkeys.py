@@ -10,7 +10,8 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any, List
 
-from flask import Flask, render_template_string, request, send_file
+from flask import Flask, render_template_string, request, send_file, send_from_directory
+from werkzeug.utils import secure_filename
 
 from cryptography import x509
 from cryptography.x509 import NameOID
@@ -410,7 +411,9 @@ def generate_selfsigned_from_priv(priv_pem: bytes, subject_cn: str = "example.co
 # Flask Web App
 # =========================
 
+DOWNLOAD_DIR = "/tmp"
 app = Flask(__name__)
+app.config["DOWNLOAD_DIR"] = DOWNLOAD_DIR
 
 INDEX_HTML = '''
 <!doctype html>
@@ -503,11 +506,11 @@ Self-Signed:  openssl req -x509 -new -key private.pem -days 365 -sha256 -out cer
   {% endif %}
   <pre>{{ result.json }}</pre>
   {% if result.download_name %}
-    <p><a class="btn" href="/download?path={{ result.download_path }}&name={{ result.download_name }}">دانلود خروجی</a></p>
+    <p><a class="btn" href="/download?filename={{ result.download_path }}&name={{ result.download_name }}">دانلود خروجی</a></p>
   {% endif %}
   {% if result.report_html or result.report_md %}
-    {% if result.report_html %}<p><a class="btn" href="/download?path={{ result.report_html }}&name=report.html">دانلود گزارش HTML</a></p>{% endif %}
-    {% if result.report_md %}<p><a class="btn" href="/download?path={{ result.report_md }}&name=report.md">دانلود گزارش Markdown</a></p>{% endif %}
+    {% if result.report_html %}<p><a class="btn" href="/download?filename={{ result.report_html }}&name=report.html">دانلود گزارش HTML</a></p>{% endif %}
+    {% if result.report_md %}<p><a class="btn" href="/download?filename={{ result.report_md }}&name=report.md">دانلود گزارش Markdown</a></p>{% endif %}
   {% endif %}
 </div>
 {% endif %}
@@ -580,8 +583,8 @@ def route_analyze():
         "plot_div": pie_div,
         "json": json.dumps(data, indent=2, ensure_ascii=False),
         "badge": badge,
-        "report_html": html_report,
-        "report_md": md_report,
+        "report_html": os.path.basename(html_report) if html_report else None,
+        "report_md": os.path.basename(md_report) if md_report else None,
         "download_name": None,
         "download_path": None,
     }
@@ -626,10 +629,10 @@ def route_create_from_priv():
         "plot_div": pie_div,
         "json": json.dumps(res, indent=2, ensure_ascii=False),
         "badge": {"text": "ایجاد شد", "color": "green"},
-        "report_html": html_report,
-        "report_md": md_report,
+        "report_html": os.path.basename(html_report) if html_report else None,
+        "report_md": os.path.basename(md_report) if md_report else None,
         "download_name": out_name,
-        "download_path": path,
+        "download_path": out_name,
     }
     return render_template_string(INDEX_HTML, result=result)
 
@@ -663,8 +666,8 @@ def route_convert():
         "plot_div": pie_div,
         "json": json.dumps(res, indent=2, ensure_ascii=False),
         "badge": {"text": "تبدیل انجام شد", "color": "green"},
-        "report_html": html_report,
-        "report_md": md_report,
+        "report_html": os.path.basename(html_report) if html_report else None,
+        "report_md": os.path.basename(md_report) if md_report else None,
         "download_name": None,
         "download_path": None,
     }
@@ -693,8 +696,8 @@ def route_match():
         "plot_div": pie_div,
         "json": json.dumps(data, indent=2, ensure_ascii=False),
         "badge": badge,
-        "report_html": html_report,
-        "report_md": md_report,
+        "report_html": os.path.basename(html_report) if html_report else None,
+        "report_md": os.path.basename(md_report) if md_report else None,
         "download_name": None,
         "download_path": None,
     }
@@ -703,11 +706,13 @@ def route_match():
 
 @app.route("/download", methods=["GET"])
 def route_download():
-    path = request.args.get("path")
-    name = request.args.get("name") or os.path.basename(path)
-    if not path or not os.path.exists(path):
-        return "file not found", 404
-    return send_file(path, as_attachment=True, download_name=name)
+    filename = request.args.get("filename")
+    name = request.args.get("name") or filename
+    if not filename:
+        return "filename not specified", 400
+
+    filename = secure_filename(filename)
+    return send_from_directory(app.config["DOWNLOAD_DIR"], filename, as_attachment=True, download_name=name)
 
 
 # =========================
