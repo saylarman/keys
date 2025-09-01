@@ -990,7 +990,7 @@ def _pie_div(security: Optional[str]) -> str:
 
 
 def _make_report_files(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     html_path = f"/tmp/report_{ts}.html"
     md_path   = f"/tmp/report_{ts}.md"
     title = f"Analysis Report — {data.get('file','input')}"
@@ -1185,36 +1185,32 @@ def route_convert():
     file = request.files.get("priv")
     password = request.form.get("password") or None
     raw = file.read()
-    outputs = convert_formats_from_priv(raw, passphrase=password)
+    try:
+        outputs = convert_formats_from_priv(raw, passphrase=password)
+    except Exception as e:
+        return f"Error during conversion: {e}", 500
+
     manifest = {}
-    saved_paths = []
     for name, content in outputs.items():
         out_name = f"{name}.{'pem' if name.endswith('_pem') or 'public_pem' in name else 'bin'}"
-        # adjust good names
         if name == "private_der": out_name = "private.der"
         if name == "public_pem":  out_name = "public.pem"
         if name == "public_ssh":  out_name = "public_ssh.pub"
-        full = f"/tmp/{out_name}"
+        full = os.path.join(app.config["DOWNLOAD_DIR"], out_name)
         with open(full, "wb") as f:
             f.write(content)
         manifest[name] = out_name
-        saved_paths.append(full)
 
-    res = {"status": "ok", "artifacts": manifest}
-    pie_div = ""
-    html_report, md_report = _make_report_files(res)
-
-    # provide ZIP? keep it simple: suggest individual downloads in manifest via next action; here single button downloads nothing.
-    result = {
-        "plot_div": pie_div,
-        "json": json.dumps(res, indent=2, ensure_ascii=False),
-        "badge": {"text": "تبدیل انجام شد", "color": "green"},
-        "report_html": os.path.basename(html_report) if html_report else None,
-        "report_md": os.path.basename(md_report) if md_report else None,
-        "download_name": None,
-        "download_path": None,
+    res = {
+        "type": "Format Conversion",
+        "details": {
+            "artifacts": manifest,
+            "note": "Conversion successful. Individual files can be downloaded from the report."
+        },
+        "file": file.filename,
+        "fingerprints": None, "cert_chain": None, "guidance": None, "jwk": None
     }
-    return render_template_string(INDEX_HTML, result=result)
+    return _render_analysis_result(res)
 
 
 @app.route("/manage_password", methods=["POST"])
@@ -1377,21 +1373,17 @@ def route_match():
     except Exception as e:
         err = str(e)
 
-    data = {"match": bool(ok), "error": err}
-    pie_div = ""
-    html_report, md_report = _make_report_files(data)
-    badge = {"text": "تطبیق: بله" if ok else "تطبیق: خیر", "color": "green" if ok else "red"}
-
-    result = {
-        "plot_div": pie_div,
-        "json": json.dumps(data, indent=2, ensure_ascii=False),
-        "badge": badge,
-        "report_html": os.path.basename(html_report) if html_report else None,
-        "report_md": os.path.basename(md_report) if md_report else None,
-        "download_name": None,
-        "download_path": None,
+    data = {
+        "type": "Key/Cert Match",
+        "details": {
+            "match": bool(ok),
+            "error": err,
+            "status_text": "✅ Keys MATCH" if ok else "❌ Keys DO NOT MATCH"
+        },
+        "file": f"{priv_file.filename} vs {cert_file.filename}",
+        "fingerprints": None, "cert_chain": None, "guidance": None, "jwk": None
     }
-    return render_template_string(INDEX_HTML, result=result)
+    return _render_analysis_result(data)
 
 
 @app.route("/download", methods=["GET"])
