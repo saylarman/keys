@@ -15,10 +15,11 @@ from flask import Flask, render_template_string, request, send_file, send_from_d
 from werkzeug.utils import secure_filename
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.x509 import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption
-from cryptography.hazmat.primitives.asymmetric import rsa, ec, ed25519
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec, ed25519
 from cryptography.hazmat.primitives.serialization.ssh import load_ssh_public_key
 
 from jwcrypto import jwk
@@ -490,6 +491,111 @@ def generate_private_key(key_type: str, rsa_key_size: int = 2048, ec_curve: str 
     )
 
 
+def update_key_password(key_pem: bytes, current_pass: Optional[str], new_pass: Optional[str]) -> bytes:
+    """Loads a private key and re-serializes it with a new password or none."""
+    current_pass_bytes = current_pass.encode() if current_pass else None
+
+    # Load the private key with its current password
+    private_key = serialization.load_pem_private_key(
+        key_pem,
+        password=current_pass_bytes
+    )
+
+    # Determine the new encryption type
+    if new_pass:
+        encryption_algorithm = BestAvailableEncryption(new_pass.encode())
+    else:
+        encryption_algorithm = NoEncryption()
+
+    # Re-serialize the key with the new encryption
+    return private_key.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=encryption_algorithm
+    )
+
+
+def sign_data(key_pem: bytes, password: Optional[str], data: bytes, hash_algo: str, padding_scheme: str) -> bytes:
+    """Signs data with a private key and returns the signature."""
+    password_bytes = password.encode() if password else None
+    private_key = serialization.load_pem_private_key(key_pem, password=password_bytes)
+
+    hash_obj = getattr(hashes, hash_algo.upper())()
+
+    if isinstance(private_key, rsa.RSAPrivateKey):
+        if padding_scheme.upper() == 'PSS':
+            pad = padding.PSS(mgf=padding.MGF1(hash_obj), salt_length=padding.PSS.MAX_LENGTH)
+        elif padding_scheme.upper() == 'PKCS1V15':
+            pad = padding.PKCS1v15()
+        else:
+            raise ValueError("Unsupported padding scheme for RSA")
+
+        signature = private_key.sign(data, pad, hash_obj)
+    elif isinstance(private_key, ec.EllipticCurvePrivateKey):
+        signature = private_key.sign(data, ec.ECDSA(hash_obj))
+    else:
+        raise ValueError("Unsupported key type for signing")
+
+    return signature
+
+
+def verify_signature(pub_key_pem: bytes, signature: bytes, data: bytes, hash_algo: str, padding_scheme: str) -> bool:
+    """Verifies a signature with a public key."""
+    public_key = load_any_public_key(pub_key_pem)
+    if public_key is None:
+        # Maybe it's a certificate?
+        try:
+            cert = x509.load_pem_x509_certificate(pub_key_pem)
+            public_key = cert.public_key()
+        except Exception:
+            raise ValueError("Invalid Public Key or Certificate file")
+
+    hash_obj = getattr(hashes, hash_algo.upper())()
+
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            if padding_scheme.upper() == 'PSS':
+                pad = padding.PSS(mgf=padding.MGF1(hash_obj), salt_length=padding.PSS.MAX_LENGTH)
+            elif padding_scheme.upper() == 'PKCS1V15':
+                pad = padding.PKCS1v15()
+            else:
+                raise ValueError("Unsupported padding scheme")
+
+            public_key.verify(signature, data, pad, hash_obj)
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, data, ec.ECDSA(hash_obj))
+        else:
+            raise ValueError("Unsupported key type for verification")
+
+        return True
+    except InvalidSignature:
+        return False
+
+
+def encrypt_data(pub_key_pem: bytes, plaintext: bytes) -> bytes:
+    """Encrypts data with an RSA public key."""
+    public_key = load_any_public_key(pub_key_pem)
+    if public_key is None:
+        try:
+            cert = x509.load_pem_x509_certificate(pub_key_pem)
+            public_key = cert.public_key()
+        except Exception:
+            raise ValueError("Invalid Public Key or Certificate file")
+
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise TypeError("Encryption is only supported for RSA keys with this tool.")
+
+    ciphertext = public_key.encrypt(
+        plaintext,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return ciphertext
+
+
 # =========================
 # Flask Web App
 # =========================
@@ -610,13 +716,101 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
 </div>
 
 <div class="card">
-  <h2>۵) تطبیق Private Key و Certificate</h2>
+  <h2>۵) مدیریت رمز عبور کلید خصوصی</h2>
+  <form method="post" action="/manage_password" enctype="multipart/form-data">
+    <label>فایل کلید خصوصی (PEM):</label>
+    <input type="file" name="priv_key" required>
+    <label>رمز عبور فعلی (اگر کلید رمز دارد):</label>
+    <input type="password" name="current_pass" placeholder="اختیاری">
+    <label>رمز عبور جدید (برای حذف رمز، این فیلد را خالی بگذارید):</label>
+    <input type="password" name="new_pass" placeholder="اختیاری">
+    <button class="btn" type="submit">اعمال تغییرات</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>۶) تطبیق Private Key و Certificate</h2>
   <form method="post" action="/match" enctype="multipart/form-data">
     <label>Private Key (PEM):</label>
     <input type="file" name="priv" required>
     <label>Certificate (PEM):</label>
     <input type="file" name="cert" required>
     <button class="btn" type="submit">بررسی تطبیق</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>۷) امضای دیجیتال داده</h2>
+  <form method="post" action="/sign" enctype="multipart/form-data">
+    <label>فایل کلید خصوصی (PEM):</label>
+    <input type="file" name="priv_key" required>
+    <label>رمز عبور کلید خصوصی (اگر وجود دارد):</label>
+    <input type="password" name="password">
+    <label>داده برای امضا:</label>
+    <textarea name="data_to_sign" rows="5" required style="width:100%;box-sizing:border-box;"></textarea>
+    <div class="row">
+        <div>
+            <label>الگوریتم هش:</label>
+            <select name="hash_algo">
+                <option value="SHA256" selected>SHA-256</option>
+                <option value="SHA384">SHA-384</option>
+                <option value="SHA512">SHA-512</option>
+            </select>
+        </div>
+        <div>
+            <label>Padding (برای RSA):</label>
+            <select name="padding_scheme">
+                <option value="PSS" selected>PSS</option>
+                <option value="PKCS1v15">PKCS1v15</option>
+            </select>
+        </div>
+    </div>
+    <button class="btn" type="submit">امضا کن</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>۸) تایید امضای دیجیتال</h2>
+  <form method="post" action="/verify" enctype="multipart/form-data">
+    <label>فایل کلید عمومی (PEM, SSH) یا سرتیفیکیت:</label>
+    <input type="file" name="pub_key" required>
+    <label>داده اصلی (که امضا شده):</label>
+    <textarea name="original_data" rows="5" required style="width:100%;box-sizing:border-box;"></textarea>
+    <label>امضا (در فرمت Base64):</label>
+    <textarea name="signature_b64" rows="3" required style="width:100%;box-sizing:border-box;"></textarea>
+    <div class="row">
+        <div>
+            <label>الگوریتم هش:</label>
+            <select name="hash_algo">
+                <option value="SHA256" selected>SHA-256</option>
+                <option value="SHA384">SHA-384</option>
+                <option value="SHA512">SHA-512</option>
+            </select>
+        </div>
+        <div>
+            <label>Padding (برای RSA):</label>
+            <select name="padding_scheme">
+                <option value="PSS" selected>PSS</option>
+                <option value="PKCS1v15">PKCS1v15</option>
+            </select>
+        </div>
+    </div>
+    <button class="btn" type="submit">تایید امضا</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>۹) رمزنگاری داده با کلید عمومی</h2>
+  <form method="post" action="/encrypt" enctype="multipart/form-data">
+    <label>فایل کلید عمومی (PEM) یا سرتیفیکیت (فقط RSA):</label>
+    <input type="file" name="pub_key" required>
+    <label>داده برای رمزنگاری:</label>
+    <textarea name="plaintext" rows="5" required style="width:100%;box-sizing:border-box;"></textarea>
+    <label>Padding (فقط برای RSA):</label>
+    <select name="padding_scheme">
+        <option value="OAEP" selected>OAEP (SHA-256)</option>
+    </select>
+    <button class="btn" type="submit">رمزنگاری کن</button>
   </form>
 </div>
 
@@ -667,6 +861,32 @@ Self-Signed:  openssl req -x509 -new -key private.pem -days 365 -sha256 -out cer
         {% else %}
           <tr><td>Certificate</td><td>Not present in archive</td></tr>
         {% endif %}
+      {% endif %}
+
+      {# Digital Signature Result #}
+      {% if res.type == "Digital Signature" %}
+        <tr><td>Signature (Base64)</td><td><textarea readonly rows="5" style="width:100%;box-sizing:border-box;">{{ res.details.signature_base64 }}</textarea></td></tr>
+        <tr><td>Note</td><td>{{ res.details.note }}</td></tr>
+      {% endif %}
+
+      {# Signature Verification Result #}
+      {% if res.type == "Signature Verification" %}
+        <tr>
+          <td>Verification Result</td>
+          <td>
+            {% if res.details.is_valid %}
+              <span class="badge green" style="font-size:1.1em;">Signature is VALID</span>
+            {% else %}
+              <span class="badge red" style="font-size:1.1em;">Signature is INVALID</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endif %}
+
+      {# Encryption Result #}
+      {% if res.type == "Public Key Encryption" %}
+        <tr><td>Ciphertext (Base64)</td><td><textarea readonly rows="5" style="width:100%;box-sizing:border-box;">{{ res.details.ciphertext_base64 }}</textarea></td></tr>
+        <tr><td>Note</td><td>{{ res.details.note }}</td></tr>
       {% endif %}
     </tbody>
   </table>
@@ -995,6 +1215,153 @@ def route_convert():
         "download_path": None,
     }
     return render_template_string(INDEX_HTML, result=result)
+
+
+@app.route("/manage_password", methods=["POST"])
+def route_manage_password():
+    file = request.files.get("priv_key")
+    if not file:
+        return "Private key file not provided", 400
+
+    key_pem = file.read()
+    current_pass = request.form.get("current_pass") or None
+    new_pass = request.form.get("new_pass") or None
+
+    try:
+        new_key_pem = update_key_password(key_pem, current_pass, new_pass)
+    except (ValueError, TypeError):
+        # ValueError for wrong password, TypeError if key is public
+        return "رمز عبور فعلی اشتباه است یا فایل کلید خصوصی معتبر نیست.", 400
+    except Exception as e:
+        return f"An unexpected error occurred: {e}", 500
+
+    # Save the new key for download
+    out_name = "private_key_updated.pem"
+    path = os.path.join(app.config["DOWNLOAD_DIR"], out_name)
+    with open(path, "wb") as f:
+        f.write(new_key_pem)
+
+    res = {
+        "status": "ok",
+        "action": "manage_password",
+        "note": f"عملیات با موفقیت انجام شد. کلید جدید در فایل {out_name} آماده دانلود است.",
+    }
+
+    result = {
+        "plot_div": "",
+        "json": json.dumps(res, indent=2, ensure_ascii=False),
+        "badge": {"text": "رمز عبور به‌روز شد", "color": "green"},
+        "report_html": None,
+        "report_md": None,
+        "download_name": out_name,
+        "download_path": out_name,
+    }
+    return render_template_string(INDEX_HTML, result=result)
+
+
+@app.route("/sign", methods=["POST"])
+def route_sign():
+    file = request.files.get("priv_key")
+    password = request.form.get("password") or None
+    data_to_sign = request.form.get("data_to_sign", "").encode()
+    hash_algo = request.form.get("hash_algo", "SHA256")
+    padding_scheme = request.form.get("padding_scheme", "PSS")
+
+    if not file or not data_to_sign:
+        return "Private key or data to sign not provided", 400
+
+    key_pem = file.read()
+
+    try:
+        signature = sign_data(key_pem, password, data_to_sign, hash_algo, padding_scheme)
+        signature_b64 = base64.b64encode(signature).decode('ascii')
+    except Exception as e:
+        return f"Error during signing: {e}", 500
+
+    res = {
+        "type": "Digital Signature",
+        "details": {
+            "signature_base64": signature_b64,
+            "note": "Data signed successfully."
+        },
+        "file": file.filename,
+        "fingerprints": None,
+        "cert_chain": None,
+        "guidance": None,
+        "jwk": None
+    }
+
+    return _render_analysis_result(res)
+
+
+@app.route("/verify", methods=["POST"])
+def route_verify():
+    pub_key_file = request.files.get("pub_key")
+    original_data = request.form.get("original_data", "").encode()
+    signature_b64 = request.form.get("signature_b64", "")
+    hash_algo = request.form.get("hash_algo", "SHA256")
+    padding_scheme = request.form.get("padding_scheme", "PSS")
+
+    if not pub_key_file or not original_data or not signature_b64:
+        return "Public key, data, or signature not provided", 400
+
+    pub_key_pem = pub_key_file.read()
+    try:
+        signature = base64.b64decode(signature_b64)
+    except Exception:
+        return "Signature is not valid Base64", 400
+
+    try:
+        is_valid = verify_signature(pub_key_pem, signature, original_data, hash_algo, padding_scheme)
+    except Exception as e:
+        return f"Error during verification: {e}", 500
+
+    res = {
+        "type": "Signature Verification",
+        "details": {
+            "is_valid": is_valid,
+            "status_text": "VALID" if is_valid else "INVALID"
+        },
+        "file": pub_key_file.filename,
+        "fingerprints": None,
+        "cert_chain": None,
+        "guidance": None,
+        "jwk": None
+    }
+
+    return _render_analysis_result(res)
+
+
+@app.route("/encrypt", methods=["POST"])
+def route_encrypt():
+    pub_key_file = request.files.get("pub_key")
+    plaintext = request.form.get("plaintext", "").encode()
+
+    if not pub_key_file or not plaintext:
+        return "Public key or plaintext not provided", 400
+
+    pub_key_pem = pub_key_file.read()
+
+    try:
+        ciphertext = encrypt_data(pub_key_pem, plaintext)
+        ciphertext_b64 = base64.b64encode(ciphertext).decode('ascii')
+    except Exception as e:
+        return f"Error during encryption: {e}", 500
+
+    res = {
+        "type": "Public Key Encryption",
+        "details": {
+            "ciphertext_base64": ciphertext_b64,
+            "note": "Data encrypted successfully."
+        },
+        "file": pub_key_file.filename,
+        "fingerprints": None,
+        "cert_chain": None,
+        "guidance": None,
+        "jwk": None
+    }
+
+    return _render_analysis_result(res)
 
 
 @app.route("/match", methods=["POST"])
