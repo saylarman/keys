@@ -8,7 +8,7 @@ import zipfile
 import json
 import base64
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any, List
 
 from flask import Flask, render_template_string, request, send_file, send_from_directory
@@ -990,7 +990,7 @@ def _pie_div(security: Optional[str]) -> str:
 
 
 def _make_report_files(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    ts = datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     html_path = f"/tmp/report_{ts}.html"
     md_path   = f"/tmp/report_{ts}.md"
     title = f"Analysis Report — {data.get('file','input')}"
