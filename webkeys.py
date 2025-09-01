@@ -19,7 +19,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.x509 import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption
-from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec, ed25519
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec, ed25519, ed448
 from cryptography.hazmat.primitives.serialization.ssh import load_ssh_public_key
 
 from jwcrypto import jwk
@@ -143,6 +143,9 @@ def public_key_to_jwk_obj(pub) -> Dict[str, Any]:
     if isinstance(pub, ed25519.Ed25519PublicKey):
         raw = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
         return {"kty": "OKP", "crv": "Ed25519", "x": _b64url_no_pad(raw)}
+    if isinstance(pub, ed448.Ed448PublicKey):
+        raw = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return {"kty": "OKP", "crv": "Ed448", "x": _b64url_no_pad(raw)}
     raise ValueError("Unsupported public key type for JWK")
 
 
@@ -160,6 +163,10 @@ def private_key_to_jwk_obj(priv, password: Optional[bytes] = None) -> Dict[str, 
         jwk_pub["d"] = _b64url_no_pad(numbers_to_bytes)
         return jwk_pub
     if isinstance(priv, ed25519.Ed25519PrivateKey):
+        raw = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        jwk_pub["d"] = _b64url_no_pad(raw)
+        return jwk_pub
+    if isinstance(priv, ed448.Ed448PrivateKey):
         raw = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
         jwk_pub["d"] = _b64url_no_pad(raw)
         return jwk_pub
@@ -286,6 +293,8 @@ def analyze_bytes(raw: bytes, filename: str = "input", password: Optional[str] =
                 out["details"] = {"algorithm": "EC", "curve": priv.curve.name, "key_size": priv.key_size, "security": estimate_security(priv.key_size, "EC")}
             elif isinstance(priv, ed25519.Ed25519PrivateKey):
                 out["details"] = {"algorithm": "Ed25519", "key_size": 256, "security": "Strong"}
+            elif isinstance(priv, ed448.Ed448PrivateKey):
+                out["details"] = {"algorithm": "Ed448", "key_size": 456, "security": "Strong"}
             out["jwk"] = private_key_to_jwk_obj(priv)
             # guidance (OpenSSL) + internal generation pointers
             out["guidance"] = {
@@ -310,6 +319,8 @@ def analyze_bytes(raw: bytes, filename: str = "input", password: Optional[str] =
                 out["details"] = {"algorithm": "EC", "curve": pub.curve.name, "key_size": pub.key_size, "security": estimate_security(pub.key_size, "EC")}
             elif isinstance(pub, ed25519.Ed25519PublicKey):
                 out["details"] = {"algorithm": "Ed25519", "key_size": 256, "security": "Strong"}
+            elif isinstance(pub, ed448.Ed448PublicKey):
+                out["details"] = {"algorithm": "Ed448", "key_size": 456, "security": "Strong"}
             out["jwk"] = public_key_to_jwk_obj(pub)
             out["guidance"] = {
                 "make_selfsigned_from_priv": "برای ساخت سرتیفیکیت نیاز به کلید خصوصی دارید. ابتدا Private Key را آپلود کنید یا مسیر آن را بدهید."
@@ -471,18 +482,21 @@ def generate_selfsigned_from_priv(priv_pem: bytes, subject_cn: str = "example.co
 
 
 def generate_private_key(key_type: str, rsa_key_size: int = 2048, ec_curve: str = "SECP384R1") -> bytes:
-    """Generates an RSA or EC private key and returns it as PEM bytes."""
+    """Generates an RSA, EC, or Edwards-curve private key and returns it as PEM bytes."""
     if key_type == "rsa":
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=rsa_key_size,
         )
     elif key_type == "ec":
-        # Note: The curve name from the form needs to match an object in `cryptography.hazmat.primitives.asymmetric.ec`
         curve_obj = getattr(ec, ec_curve.upper())()
         private_key = ec.generate_private_key(curve_obj)
+    elif key_type == "ed25519":
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    elif key_type == "ed448":
+        private_key = ed448.Ed448PrivateKey.generate()
     else:
-        raise ValueError("Unsupported key type")
+        raise ValueError(f"Unsupported key type: {key_type}")
 
     return private_key.private_bytes(
         encoding=Encoding.PEM,
@@ -663,6 +677,8 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
         <select name="key_type" id="key_type">
           <option value="rsa" selected>RSA</option>
           <option value="ec">Elliptic Curve (EC)</option>
+          <option value="ed25519">Ed25519</option>
+          <option value="ed448">Ed448</option>
         </select>
       </div>
       <div>
@@ -680,6 +696,7 @@ input,select,button{padding:8px;border-radius:8px;border:1px solid #ccc}
             <option value="SECP256R1">SECP256R1 (P-256)</option>
             <option value="SECP384R1">SECP384R1 (P-384)</option>
             <option value="SECP521R1">SECP521R1 (P-521)</option>
+            <option value="SECP256K1">SECP256K1 (Bitcoin curve)</option>
           </select>
         </div>
       </div>
@@ -947,13 +964,17 @@ function toggleKeyParams() {
   var key_type = document.getElementById('key_type').value;
   var rsa_params = document.getElementById('rsa_params');
   var ec_params = document.getElementById('ec_params');
+
+  // Hide all by default
+  rsa_params.style.display = 'none';
+  ec_params.style.display = 'none';
+
   if (key_type === 'rsa') {
     rsa_params.style.display = 'block';
-    ec_params.style.display = 'none';
-  } else {
-    rsa_params.style.display = 'none';
+  } else if (key_type === 'ec') {
     ec_params.style.display = 'block';
   }
+  // For Ed25519 and Ed448, both remain hidden as they have no parameters.
 }
 document.addEventListener('DOMContentLoaded', function() {
     toggleKeyParams();
@@ -1102,6 +1123,9 @@ def route_generate():
             ec_curve = request.form.get("ec_curve", "SECP384R1")
             key_pem = generate_private_key(key_type="ec", ec_curve=ec_curve)
             out_name = f"ec_{ec_curve}_private_key.pem"
+        elif key_type in ("ed25519", "ed448"):
+            key_pem = generate_private_key(key_type=key_type)
+            out_name = f"{key_type}_private_key.pem"
         else:
             return "Invalid key type", 400
     except Exception as e:
